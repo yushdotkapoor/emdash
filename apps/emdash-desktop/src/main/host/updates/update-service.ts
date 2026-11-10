@@ -8,6 +8,7 @@ import { updateEvents } from '@core/features/updates/node';
 import { IS_CANARY, UPDATE_CHANNEL } from '@core/primitives/app-identity/api/app-identity';
 import { resolveAppVersion } from '@main/core/app/utils';
 import { log } from '@main/lib/logger';
+import { cancelRelaunchRequest, isSelfBuildEnabled, quitForSwap, runSelfBuild } from './self-build';
 import { formatUpdaterError, getUpdaterErrorDetails, sanitizeUpdaterLogArgs } from './utils';
 
 let autoUpdater: typeof _electronUpdater.autoUpdater | undefined;
@@ -56,6 +57,7 @@ export class UpdateService implements Disposable {
   private initialized = false;
   private active = false;
   private installRequested = false;
+  private selfBuilt = false;
   private installRestartGuardTimer?: NodeJS.Timeout;
   private notificationPublisher?: UpdateNotificationPublisher;
 
@@ -152,13 +154,15 @@ export class UpdateService implements Disposable {
       });
     });
 
-    autoUpdater.on('update-downloaded', (info: UpdateInfo) => {
-      this.clearError();
-      this.updateState.status = 'downloaded';
-      this.updateState.rollbackVersion = this.updateState.currentVersion;
-      updateEvents.emit(undefined, { type: 'downloaded', version: info.version });
-      this.publishNotification((publisher) => publisher.downloaded(info.version));
-    });
+    autoUpdater.on('update-downloaded', (info: UpdateInfo) => this.markDownloaded(info.version));
+  }
+
+  private markDownloaded(version: string): void {
+    this.clearError();
+    this.updateState.status = 'downloaded';
+    this.updateState.rollbackVersion = this.updateState.currentVersion;
+    updateEvents.emit(undefined, { type: 'downloaded', version });
+    this.publishNotification((publisher) => publisher.downloaded(version));
   }
 
   private scheduleNextCheck(delay = CHECK_INTERVAL_MS): void {
@@ -221,9 +225,16 @@ export class UpdateService implements Disposable {
     this.clearError();
     this.updateState.downloadProgress = undefined;
     this.updateState.status = 'downloading';
+    const version = this.updateState.availableVersion;
+    this.selfBuilt = isSelfBuildEnabled();
     this.currentDownloadPromise = Promise.resolve()
       .then(async () => {
-        await getAutoUpdater().downloadUpdate();
+        if (this.selfBuilt) {
+          await runSelfBuild();
+          this.markDownloaded(version);
+        } else {
+          await getAutoUpdater().downloadUpdate();
+        }
       })
       .catch((error: unknown) => this.handleError(error))
       .finally(() => {
@@ -301,6 +312,7 @@ export class UpdateService implements Disposable {
 
     const rollback = (reason: string) => {
       clearGuard();
+      if (this.selfBuilt) cancelRelaunchRequest();
       this.installRequested = false;
       this.updateState.status = 'downloaded';
       if (this.updateState.availableVersion) {
@@ -321,7 +333,8 @@ export class UpdateService implements Disposable {
 
     setTimeout(() => {
       try {
-        getAutoUpdater().quitAndInstall(false, true);
+        if (this.selfBuilt) quitForSwap();
+        else getAutoUpdater().quitAndInstall(false, true);
       } catch (error) {
         rollback(`quitAndInstall threw: ${formatUpdaterError(error)}`);
       }

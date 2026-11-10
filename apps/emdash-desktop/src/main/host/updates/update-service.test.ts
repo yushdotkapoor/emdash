@@ -20,6 +20,13 @@ vi.mock('@main/core/app/utils', () => ({ resolveAppVersion: async () => '1.2.5' 
 vi.mock('@main/lib/logger', () => ({
   log: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
+const selfBuild = vi.hoisted(() => ({
+  isSelfBuildEnabled: vi.fn(() => false),
+  runSelfBuild: vi.fn<() => Promise<void>>(),
+  quitForSwap: vi.fn(),
+  cancelRelaunchRequest: vi.fn(),
+}));
+vi.mock('./self-build', () => selfBuild);
 
 const info: UpdateInfo = { version: '1.2.6', files: [], path: '', sha512: '', releaseDate: '' };
 const updater = Object.assign(new EventEmitter(), {
@@ -40,6 +47,7 @@ beforeEach(async () => {
   updater.removeAllListeners();
   vi.clearAllMocks();
   mocks.getUpdater.mockReturnValue(updater);
+  selfBuild.isSelfBuildEnabled.mockReturnValue(false);
   transfer = deferred<string[]>();
   updater.downloadUpdate.mockImplementation(() => transfer.promise);
   service = new UpdateService();
@@ -129,5 +137,67 @@ describe('desktop update lifecycle', () => {
     updater.emit('update-downloaded', info);
     transfer.resolve([]);
     expect(service.getState().error).toBeUndefined();
+  });
+});
+
+describe('self-build updates', () => {
+  let build: ReturnType<typeof deferred<void>>;
+
+  beforeEach(() => {
+    build = deferred<void>();
+    selfBuild.isSelfBuildEnabled.mockReturnValue(true);
+    selfBuild.runSelfBuild.mockImplementation(() => build.promise);
+  });
+
+  async function buildReady(): Promise<void> {
+    service.downloadUpdate();
+    build.resolve();
+    await vi.advanceTimersByTimeAsync(1);
+  }
+
+  it('builds from source instead of downloading the release, then offers restart', async () => {
+    const publisher = { available: vi.fn(), downloaded: vi.fn(), error: vi.fn() };
+    service.setNotificationPublisher(publisher);
+    service.downloadUpdate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(selfBuild.runSelfBuild).toHaveBeenCalledTimes(1);
+    expect(updater.downloadUpdate).not.toHaveBeenCalled();
+    expect(service.getState().status).toBe('downloading');
+    build.resolve();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(service.getState()).toMatchObject({ status: 'downloaded', rollbackVersion: '1.2.5' });
+    expect(publisher.downloaded).toHaveBeenCalledWith('1.2.6');
+  });
+
+  it('surfaces a failed build as a retryable error', async () => {
+    service.downloadUpdate();
+    build.reject(new Error('Update build failed (exit 1)'));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(service.getState()).toMatchObject({
+      status: 'error',
+      error: 'Update build failed (exit 1)',
+    });
+    selfBuild.runSelfBuild.mockResolvedValueOnce();
+    service.downloadUpdate();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(selfBuild.runSelfBuild).toHaveBeenCalledTimes(2);
+    expect(service.getState().status).toBe('downloaded');
+  });
+
+  it('restarts by quitting for the swap instead of running the Squirrel installer', async () => {
+    await buildReady();
+    service.quitAndInstall();
+    expect(service.getState().status).toBe('installing');
+    await vi.advanceTimersByTimeAsync(250);
+    expect(selfBuild.quitForSwap).toHaveBeenCalledTimes(1);
+    expect(updater.quitAndInstall).not.toHaveBeenCalled();
+  });
+
+  it('withdraws the relaunch request when the app does not quit', async () => {
+    await buildReady();
+    service.quitAndInstall();
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
+    expect(selfBuild.cancelRelaunchRequest).toHaveBeenCalledTimes(1);
+    expect(service.getState().status).toBe('downloaded');
   });
 });
